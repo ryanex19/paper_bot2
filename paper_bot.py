@@ -1,245 +1,267 @@
-import json
-import logging
 import time
-from datetime import datetime, timezone
-import numpy as np
-import pandas as pd
+import json
+import csv
+import signal
+import sys
+import os
+from datetime import datetime
 import requests
 
-# Set up clean logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
-logger = logging.getLogger(__name__)
+# ==========================================
+# CONFIGURATION
+# ==========================================
+INITIAL_BALANCE = 3000.0  # Starting Paper Balance ($)
+MAX_TRADE_SIZE = 45.0     # Max USD spent per arbitrage trade
+MIN_EDGE = 0.025          # 2.5% minimum gross edge (0.025)
+MIN_DEPTH_USD = 2.00      # Ignore orders with less than $2 available liquidity
+POLL_INTERVAL = 5         # Seconds between market scans
+CSV_FILENAME = "paper_trades.csv"
 
+# Keywords used to ensure we ONLY scan crypto-related markets
+CRYPTO_KEYWORDS = ["btc", "eth", "sol", "bitcoin", "ethereum", "updown", "up/down", "5m", "15m", "crypto"]
 
-class PolymarketCryptoFetcher:
-    """Fetches, parses, and cleans Polymarket crypto binary market data
+# API Endpoints
+GAMMA_API_URL = "https://gamma-api.polymarket.com"
+CLOB_API_URL = "https://clob.polymarket.com"
 
-    via public REST APIs (Gamma API and CLOB API).
-    """
+# Setup resilient HTTP session
+session = requests.Session()
+session.headers.update({"User-Agent": "PolymarketCryptoPaperBot/4.0"})
 
-    GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
-    CLOB_BASE_URL = "https://clob.polymarket.com"
+# Global State
+balance = INITIAL_BALANCE
+trades_history = []
 
-    def __init__(self, session: requests.Session = None):
-        self.session = session or requests.Session()
-        self.session.headers.update(
-            {"User-Agent": "PolymarketCryptoDataPipeline/1.0", "Accept": "application/json"}
-        )
+# ==========================================
+# GRACEFUL SHUTDOWN & LOGGING
+# ==========================================
+def save_trades_to_csv():
+    """Flushes recorded paper trades to CSV upon shutdown."""
+    if not trades_history:
+        print("[SYSTEM] No trades recorded in this session.", flush=True)
+        return
+    
+    file_exists = os.path.isfile(CSV_FILENAME)
+    try:
+        with open(CSV_FILENAME, mode="a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=trades_history[0].keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerows(trades_history)
+        print(f"[SYSTEM] Successfully exported {len(trades_history)} trades to {CSV_FILENAME}", flush=True)
+    except Exception as e:
+        print(f"[ERROR] Failed to save CSV file: {e}", flush=True)
 
-    def fetch_crypto_events(
-        self, tag_id: int = 21, limit: int = 100, active_only: bool = True
-    ) -> list:
-        """Fetch crypto prediction events from the Gamma API.
+def signal_handler(sig, frame):
+    """Handles container SIGTERM / SIGINT for safe Railway shutdown."""
+    print("\n[SYSTEM] Termination signal received. Saving logs...", flush=True)
+    save_trades_to_csv()
+    sys.exit(0)
 
-        Tag ID 21 is reserved for Crypto markets on Polymarket.
-        """
-        endpoint = f"{self.GAMMA_BASE_URL}/events"
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# ==========================================
+# MARKET & CLOB PRICE FETCHING
+# ==========================================
+def is_crypto_market(market):
+    """Filters out non-crypto markets (e.g. politics, pop culture, sports)."""
+    title = (market.get("question") or market.get("title") or "").lower()
+    return any(keyword in title for keyword in CRYPTO_KEYWORDS)
+
+def get_btc_5m_slugs():
+    """Generates current and upcoming deterministic 5m BTC market slugs."""
+    now = int(time.time())
+    current_window = now - (now % 300)
+    return [
+        f"btc-updown-5m-{current_window}",
+        f"btc-updown-5m-{current_window + 300}"
+    ]
+
+def fetch_market_by_slug(slug):
+    """Fetches market metadata from Gamma API via event slug."""
+    try:
+        resp = session.get(f"{GAMMA_API_URL}/events", params={"slug": slug}, timeout=4)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                markets = data[0].get("markets", [])
+                if markets:
+                    return markets[0]
+    except Exception:
+        pass
+    return None
+
+def fetch_top_gamma_crypto_markets():
+    """Fetches high-volume markets using Tag 21 (Crypto) from Gamma API."""
+    try:
         params = {
-            "tag_id": tag_id,
-            "limit": limit,
-            "active": str(active_only).lower(),
-            "closed": "false" if active_only else "true",
-            "order": "volume24hr",
-            "ascending": "false",
+            "tag_id": 21,  # Tag 21 is reserved for Crypto on Polymarket
+            "limit": 20, 
+            "active": "true", 
+            "closed": "false", 
+            "order": "volume24hr", 
+            "ascending": "false"
         }
-
-        try:
-            logger.info(
-                f"Fetching top {limit} crypto events from Gamma API..."
-            )
-            resp = self.session.get(endpoint, params=params, timeout=10)
-            resp.raise_for_status()
-            events = resp.json()
-            logger.info(f"Successfully retrieved {len(events)} crypto events.")
-            return events
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch events from Gamma API: {e}")
-            return []
-
-    def fetch_clob_orderbook(self, token_id: str) -> dict:
-        """Fetch the current L2 Order Book depth from CLOB API for a specific token."""
-        endpoint = f"{self.CLOB_BASE_URL}/book"
-        params = {"token_id": token_id}
-
-        try:
-            resp = self.session.get(endpoint, params=params, timeout=5)
-            resp.raise_for_status()
+        resp = session.get(f"{GAMMA_API_URL}/markets", params=params, timeout=5)
+        if resp.status_code == 200:
             return resp.json()
-        except requests.RequestException as e:
-            logger.warning(
-                f"Could not fetch order book for token {token_id}: {e}"
-            )
-            return {"bids": [], "asks": []}
+    except Exception as e:
+        print(f"[WARN] Gamma market query failed: {e}", flush=True)
+    return []
 
-    @staticmethod
-    def _safe_json_parse(val, default=None):
-        """Helper to parse JSON string representations returned by Polymarket APIs."""
-        if isinstance(val, (list, dict)):
-            return val
-        if isinstance(val, str):
-            try:
-                return json.loads(val)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        return default if default is not None else []
+def get_best_ask(token_id):
+    """
+    Fetches the best ask price from Polymarket CLOB book,
+    filtering out unrealistic/dust orders with insufficient depth.
+    """
+    if not token_id:
+        return None
+    try:
+        resp = session.get(f"{CLOB_API_URL}/book", params={"token_id": token_id}, timeout=3)
+        if resp.status_code == 200:
+            book = resp.json()
+            asks = book.get("asks", [])
+            if asks:
+                sorted_asks = sorted(asks, key=lambda x: float(x["price"]))
+                
+                # Filter for asks with real depth and price >= $0.02
+                for ask in sorted_asks:
+                    price = float(ask["price"])
+                    size = float(ask["size"])
+                    if price >= 0.02 and (price * size) >= MIN_DEPTH_USD:
+                        return price
+    except Exception:
+        pass
+    return None
 
-    def process_market_data(self, events: list) -> pd.DataFrame:
-        """Flattens nested events/markets payload into a structured, clean pandas DataFrame
+# ==========================================
+# TRADE EXECUTION ENGINE
+# ==========================================
+def process_market_arbitrage(market):
+    """Evaluates market pricing, filters phantom edges, and executes paper trade."""
+    global balance
+    
+    title = market.get("question") or market.get("title") or "Unknown Market"
+    clob_tokens = market.get("clobTokenIds")
+    
+    if isinstance(clob_tokens, str):
+        try:
+            clob_tokens = json.loads(clob_tokens)
+        except Exception:
+            return
+            
+    if not clob_tokens or len(clob_tokens) < 2:
+        return
 
-        with normalized timestamps, derived probabilities, and liquidity metrics.
-        """
-        records = []
+    up_token = clob_tokens[0]
+    down_token = clob_tokens[1]
 
-        for event in events:
-            event_id = event.get("id")
-            event_title = event.get("title", "").strip()
-            event_slug = event.get("slug", "")
+    up_ask = get_best_ask(up_token)
+    down_ask = get_best_ask(down_token)
 
-            markets = event.get("markets", [])
-            for market in markets:
-                # Basic Metadata
-                market_id = market.get("id")
-                condition_id = market.get("conditionId")
-                question = market.get("question", "").strip()
-                description = market.get("description", "").strip()
-                slug = market.get("slug", "")
+    # Fallback to Gamma prices if CLOB book is empty
+    if up_ask is None or down_ask is None:
+        try:
+            outcome_prices = json.loads(market.get("outcomePrices", "[]"))
+            if len(outcome_prices) >= 2:
+                up_ask = up_ask or float(outcome_prices[0])
+                down_ask = down_ask or float(outcome_prices[1])
+        except Exception:
+            return
 
-                # Parses stringified JSON fields safely
-                outcomes = self._safe_json_parse(
-                    market.get("outcomes"), ["Yes", "No"]
-                )
-                prices = self._safe_json_parse(market.get("outcomePrices"), [])
-                clob_tokens = self._safe_json_parse(
-                    market.get("clobTokenIds"), []
-                )
+    if up_ask is None or down_ask is None or up_ask <= 0 or down_ask <= 0:
+        return
 
-                # Parse implied probability (assuming Yes / No binary outcomes)
-                yes_price = float(prices[0]) if len(prices) > 0 else np.nan
-                no_price = float(prices[1]) if len(prices) > 1 else np.nan
+    combined_cost = up_ask + down_ask
+    edge = 1.0 - combined_cost
 
-                yes_token_id = clob_tokens[0] if len(clob_tokens) > 0 else None
-                no_token_id = clob_tokens[1] if len(clob_tokens) > 1 else None
+    short_title = (title[:30] + "..") if len(title) > 32 else title
 
-                # Extract Best Bids / Asks provided directly by Gamma
-                best_bid = (
-                    float(market["bestBid"])
-                    if market.get("bestBid") is not None
-                    else np.nan
-                )
-                best_ask = (
-                    float(market["bestAsk"])
-                    if market.get("bestAsk") is not None
-                    else np.nan
-                )
-                last_trade = (
-                    float(market["lastTradePrice"])
-                    if market.get("lastTradePrice") is not None
-                    else np.nan
-                )
+    # SANITY GUARD: Filter phantom/corrupt order books (< $0.92 sum)
+    if combined_cost < 0.92:
+        print(f"  [REJECT] {short_title:<32} | Phantom edge (Sum: ${combined_cost:.3f}). Corrupt order book skipped.", flush=True)
+        return
 
-                # Calculate Bid-Ask Spread
-                spread = (
-                    best_ask - best_bid
-                    if not np.isnan(best_ask) and not np.isnan(best_bid)
-                    else np.nan
-                )
+    # Print Live Scanning Output
+    print(f"  [SCAN]   {short_title:<32} | UP: ${up_ask:.3f} | DOWN: ${down_ask:.3f} | Sum: ${combined_cost:.3f} | Edge: {edge*100:.2f}%", flush=True)
 
-                # Volumes & Liquidity
-                volume_24h = (
-                    float(market.get("volume24hr", 0))
-                    if market.get("volume24hr")
-                    else 0.0
-                )
-                total_volume = (
-                    float(market.get("volume", 0))
-                    if market.get("volume")
-                    else 0.0
-                )
-                liquidity = (
-                    float(market.get("liquidity", 0))
-                    if market.get("liquidity")
-                    else 0.0
-                )
+    # ARBITRAGE ENTRY CONDITION
+    if edge >= MIN_EDGE:
+        if balance < MAX_TRADE_SIZE:
+            print(f"  [SKIP] Balance (${balance:.2f}) lower than required trade size (${MAX_TRADE_SIZE:.2f})", flush=True)
+            return
 
-                # Parse ISO Timestamps into UTC Datetime objects
-                created_at = pd.to_datetime(
-                    market.get("createdAt"), errors="coerce", utc=True
-                )
-                end_date = pd.to_datetime(
-                    market.get("endDate"), errors="coerce", utc=True
-                )
+        # Sizing Calculations
+        shares = MAX_TRADE_SIZE / combined_cost
+        trade_cost = shares * combined_cost
+        guaranteed_payout = shares * 1.0  # 1 UP share + 1 DOWN share converts to $1.00
+        net_profit = guaranteed_payout - trade_cost
 
-                # Append clean record
-                records.append(
-                    {
-                        "event_id": event_id,
-                        "market_id": market_id,
-                        "condition_id": condition_id,
-                        "event_title": event_title,
-                        "question": question,
-                        "slug": slug,
-                        "active": market.get("active", False),
-                        "closed": market.get("closed", False),
-                        "yes_implied_prob": yes_price,
-                        "no_implied_prob": no_price,
-                        "best_bid": best_bid,
-                        "best_ask": best_ask,
-                        "spread": spread,
-                        "last_trade_price": last_trade,
-                        "volume_24h_usd": volume_24h,
-                        "total_volume_usd": total_volume,
-                        "liquidity_usd": liquidity,
-                        "yes_token_id": yes_token_id,
-                        "no_token_id": no_token_id,
-                        "created_at": created_at,
-                        "end_date": end_date,
-                    }
-                )
+        # BALANCE UPDATE: Instantly deduct purchase cost AND credit guaranteed payout
+        balance = balance - trade_cost + guaranteed_payout
 
-        df = pd.DataFrame(records)
+        # Record Trade Details
+        trade_record = {
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "market_title": title,
+            "up_ask": round(up_ask, 3),
+            "down_ask": round(down_ask, 3),
+            "combined_cost": round(combined_cost, 3),
+            "shares": round(shares, 2),
+            "spend_usd": round(trade_cost, 2),
+            "payout_usd": round(guaranteed_payout, 2),
+            "net_profit": round(net_profit, 2),
+            "edge_pct": round(edge * 100, 2),
+            "new_balance": round(balance, 2)
+        }
+        
+        trades_history.append(trade_record)
 
-        # Post-Processing & Filtering
-        if not df.empty:
-            # Sort by 24h Trading Volume
-            df = df.sort_values(
-                by="volume_24h_usd", ascending=False
-            ).reset_index(drop=True)
+        print("\n" + "="*70, flush=True)
+        print(f"🚀 [ARBITRAGE EXECUTED] {title}", flush=True)
+        print(f"   Buy UP @ ${up_ask:.3f} + Buy DOWN @ ${down_ask:.3f} = Combined Cost: ${combined_cost:.3f}", flush=True)
+        print(f"   Spent: ${trade_cost:.2f} | Shares Received: {shares:.2f} | Instant Payout: ${guaranteed_payout:.2f}", flush=True)
+        print(f"   Net Realized Profit: +${net_profit:.2f} ({edge*100:.2f}% Edge)", flush=True)
+        print(f"   Updated Balance: ${balance:.2f}", flush=True)
+        print("="*70 + "\n", flush=True)
 
-        return df
+# ==========================================
+# MAIN LOOP
+# ==========================================
+def main():
+    print("="*70, flush=True)
+    print("      POLYMARKET CRYPTO ARBITRAGE BOT (PRODUCTION V4.0)")
+    print("="*70, flush=True)
+    print(f" Initial Balance : ${INITIAL_BALANCE:.2f}", flush=True)
+    print(f" Trade Cap       : ${MAX_TRADE_SIZE:.2f}", flush=True)
+    print(f" Minimum Edge    : {MIN_EDGE*100:.1f}%", flush=True)
+    print(f" Minimum Depth   : ${MIN_DEPTH_USD:.2f}\n", flush=True)
 
+    while True:
+        timestamp_str = datetime.now().strftime("%H:%M:%S")
+        markets_to_process = []
+        seen_ids = set()
 
-# --- Execution Example ---
+        # 1. Target 5m BTC Clock Slugs
+        for slug in get_btc_5m_slugs():
+            m = fetch_market_by_slug(slug)
+            if m and m.get("id") not in seen_ids:
+                markets_to_process.append(m)
+                seen_ids.add(m.get("id"))
+
+        # 2. Target High-Volume Crypto Markets (Filtering out politics/sports)
+        for m in fetch_top_gamma_crypto_markets():
+            if m.get("id") not in seen_ids and is_crypto_market(m):
+                markets_to_process.append(m)
+                seen_ids.add(m.get("id"))
+
+        print(f"[{timestamp_str}] Scanning {len(markets_to_process)} active crypto markets...", flush=True)
+        for market in markets_to_process:
+            process_market_arbitrage(market)
+
+        print(f"[{timestamp_str}] Available Cash: ${balance:.2f} | Total Trades Executed: {len(trades_history)}\n", flush=True)
+        time.sleep(POLL_INTERVAL)
+
 if __name__ == "__main__":
-    fetcher = PolymarketCryptoFetcher()
-
-    # 1. Fetch live events
-    events = fetcher.fetch_crypto_events(tag_id=21, limit=20, active_only=True)
-
-    # 2. Process into a structured dataframe
-    df_crypto = fetcher.process_market_data(events)
-
-    print("\n--- Polymarket Top Crypto Prediction Markets ---")
-    print(
-        df_crypto[
-            [
-                "question",
-                "yes_implied_prob",
-                "best_bid",
-                "best_ask",
-                "volume_24h_usd",
-                "liquidity_usd",
-            ]
-        ].head(10)
-    )
-
-    # 3. Fetch L2 orderbook snapshot for the top market's "YES" token
-    if not df_crypto.empty and df_crypto["yes_token_id"].iloc[0]:
-        top_token = df_crypto["yes_token_id"].iloc[0]
-        top_question = df_crypto["question"].iloc[0]
-
-        print(f"\n--- Fetching Order Book for Top Market: '{top_question}' ---")
-        orderbook = fetcher.fetch_clob_orderbook(top_token)
-        print(f"Top 3 Bids: {orderbook.get('bids', [])[:3]}")
-        print(f"Top 3 Asks: {orderbook.get('asks', [])[:3]}")
+    main()

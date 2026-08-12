@@ -1,370 +1,249 @@
+import time
 import json
-import os
+import csv
 import signal
 import sys
-import time
-from datetime import datetime, timezone
-import pandas as pd
+import os
+from datetime import datetime
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+# ==========================================
+# CONFIGURATION
+# ==========================================
+INITIAL_BALANCE = 3000.0  # Starting Paper Balance ($)
+MAX_TRADE_SIZE = 45.0     # Max USD per arbitrage trade
+MIN_EDGE = 0.025          # 2.5% minimum gross profit edge threshold
+POLL_INTERVAL = 5         # Loop delay in seconds
+CSV_FILENAME = "paper_trades.csv"
 
-# ====================== SETTINGS ======================
-STARTING_BALANCE = 3000.0
-MAX_PER_MARKET = 45.0  # Max $ to spend per market
-MAX_OPEN_MARKETS = 3
-MIN_EDGE = 0.04  # 4% minimum edge (combined ask <= 0.96)
-POLL_SECONDS = 5
+# Optional: Target wallet for copy-trading discovery
+TARGET_WALLET = "" 
 
-TARGET = os.getenv(
-    "TARGET_WALLET", "0x251c1a283703beed41590b0875a8dcb8ddd1541f"
-).lower()
-# ======================================================
+# API Endpoints
+GAMMA_API_URL = "https://gamma-api.polymarket.com"
+CLOB_API_URL = "https://clob.polymarket.com"
 
-# Endpoints
-DATA_API = "https://data-api.polymarket.com/activity"
-GAMMA_API = "https://gamma-api.polymarket.com/markets"
-CLOB_BOOK = "https://clob.polymarket.com/book"
-
-# Persistent HTTP Session for connection pooling & low latency
+# Setup resilient HTTP session
 session = requests.Session()
+session.headers.update({"User-Agent": "PolymarketPaperBot/2.0"})
 
-# State variables
-balance = STARTING_BALANCE
+# Global State
+balance = INITIAL_BALANCE
 locked_capital = 0.0
-open_positions = []  # list of open position dicts
-trade_history = []  # list of completed trade dicts
-seen_markets = set()
+trades_history = []
+active_positions = []
+scanned_markets_cache = {}
 
-
-def get_best_ask(token_id):
-    """Fetch best ask price from the order book for realistic paper fills."""
+# ==========================================
+# GRACEFUL SHUTDOWN & CSV LOGGING
+# ==========================================
+def save_trades_to_csv():
+    """Exports paper trading history to CSV."""
+    if not trades_history:
+        print("[SYSTEM] No trades recorded this session.", flush=True)
+        return
+    
+    file_exists = os.path.isfile(CSV_FILENAME)
     try:
-        r = session.get(CLOB_BOOK, params={"token_id": token_id}, timeout=4)
-        if r.status_code == 200:
-            data = r.json()
-            asks = data.get("asks", [])
-            if asks:
-                return float(asks[0]["price"])
-    except requests.RequestException:
+        with open(CSV_FILENAME, mode="a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=trades_history[0].keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerows(trades_history)
+        print(f"[SYSTEM] Successfully saved {len(trades_history)} trades to {CSV_FILENAME}", flush=True)
+    except Exception as e:
+        print(f"[ERROR] Failed to write CSV log: {e}", flush=True)
+
+def signal_handler(sig, frame):
+    """Graceful container shutdown on Railway SIGTERM/SIGINT."""
+    print("\n[SYSTEM] Shutdown signal received. Flushing logs and terminating...", flush=True)
+    save_trades_to_csv()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# ==========================================
+# MARKET DISCOVERY & CLOB PRICE FETCHING
+# ==========================================
+def get_btc_5m_slugs():
+    """Generates current and upcoming deterministic 5m BTC market slugs."""
+    now = int(time.time())
+    current_window = now - (now % 300)
+    slugs = [
+        f"btc-updown-5m-{current_window}",
+        f"btc-updown-5m-{current_window + 300}"
+    ]
+    return slugs
+
+def fetch_market_by_slug(slug):
+    """Queries Gamma API for a market using its deterministic event slug."""
+    try:
+        resp = session.get(f"{GAMMA_API_URL}/events", params={"slug": slug}, timeout=4)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                markets = data[0].get("markets", [])
+                if markets:
+                    return markets[0]
+    except Exception:
         pass
     return None
 
-
-# ==================== DUAL MARKET DISCOVERY ====================
-
-
-def discover_from_target_wallet(markets_dict):
-    """Discovery Method 1: Get active BTC markets from Target Wallet trades."""
-    params = {
-        "user": TARGET,
-        "type": "TRADE",
-        "limit": 40,
-        "sortBy": "TIMESTAMP",
-        "sortDirection": "DESC",
-    }
+def fetch_top_gamma_markets():
+    """Fetches high-volume active markets from Gamma API."""
     try:
-        r = session.get(DATA_API, params=params, timeout=10)
-        r.raise_for_status()
-        trades = r.json()
+        params = {"limit": 20, "active": "true", "closed": "false", "order": "volume24hr", "ascending": "false"}
+        resp = session.get(f"{GAMMA_API_URL}/markets", params=params, timeout=5)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        print(f"[WARN] Gamma market query failed: {e}", flush=True)
+    return []
 
-        for t in trades:
-            title = str(t.get("title", "")).lower()
-            if (
-                "bitcoin" not in title
-                and "btc" not in title
-                and "up or down" not in title
-            ):
-                continue
-
-            cid = t.get("conditionId")
-            asset = t.get("asset")
-            outcome = str(t.get("outcome", "")).capitalize()
-
-            if not cid or not asset or outcome not in ("Up", "Down"):
-                continue
-
-            if cid not in markets_dict:
-                markets_dict[cid] = {
-                    "Up": None,
-                    "Down": None,
-                    "title": t.get("title", ""),
-                }
-
-            markets_dict[cid][outcome] = asset
-            markets_dict[cid]["title"] = t.get("title", "")
-
-    except requests.RequestException as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Target Wallet API Error: {e}", flush=True)
-
-
-def discover_from_gamma(markets_dict):
-    """Discovery Method 2: Get active BTC 5-minute/Up-Down markets from Polymarket Gamma API."""
-    params = {
-        "active": "true",
-        "closed": "false",
-        "limit": 50,
-        "order": "id",
-        "ascending": "false",
-    }
+def get_best_ask(token_id):
+    """Retrieves top-of-book best ask price from Polymarket CLOB API."""
+    if not token_id:
+        return None
     try:
-        r = session.get(GAMMA_API, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        resp = session.get(f"{CLOB_API_URL}/book", params={"token_id": token_id}, timeout=3)
+        if resp.status_code == 200:
+            book = resp.json()
+            asks = book.get("asks", [])
+            if asks:
+                # Return lowest ask price
+                sorted_asks = sorted(asks, key=lambda x: float(x["price"]))
+                return float(sorted_asks[0]["price"])
+    except Exception:
+        pass
+    return None
 
-        for m in data:
-            title = str(m.get("question") or m.get("title", "")).lower()
-            if "bitcoin" not in title and "btc" not in title:
-                continue
-            if (
-                "up or down" not in title
-                and "5-minute" not in title
-                and "5m" not in title
-            ):
-                continue
-
-            cid = m.get("conditionId")
-            if not cid:
-                continue
-
-            tokens_raw = m.get("clobTokenIds")
-            outcomes_raw = m.get("outcomes")
-
-            tokens = (
-                json.loads(tokens_raw)
-                if isinstance(tokens_raw, str)
-                else (tokens_raw or [])
-            )
-            outcomes = (
-                json.loads(outcomes_raw)
-                if isinstance(outcomes_raw, str)
-                else (outcomes_raw or [])
-            )
-
-            if len(tokens) < 2:
-                continue
-
-            up_token, down_token = None, None
-            for idx, outcome_name in enumerate(outcomes):
-                name = str(outcome_name).capitalize()
-                if name in ("Up", "Yes"):
-                    up_token = tokens[idx]
-                elif name in ("Down", "No"):
-                    down_token = tokens[idx]
-
-            if not up_token and len(tokens) >= 1:
-                up_token = tokens[0]
-            if not down_token and len(tokens) >= 2:
-                down_token = tokens[1]
-
-            if cid not in markets_dict:
-                markets_dict[cid] = {
-                    "Up": None,
-                    "Down": None,
-                    "title": m.get("question") or m.get("title", ""),
-                }
-
-            if up_token:
-                markets_dict[cid]["Up"] = up_token
-            if down_token:
-                markets_dict[cid]["Down"] = down_token
-            markets_dict[cid]["title"] = m.get("question") or m.get("title", "")
-
-    except requests.RequestException as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Gamma API Error: {e}", flush=True)
-
-
-def discover_markets():
-    """Combines Target Wallet Activity and Gamma API into a single market dictionary."""
-    markets = {}
-    discover_from_target_wallet(markets)
-    discover_from_gamma(markets)
-    return markets
-
-
-# ===============================================================
-
-
-def try_open_position(cid, info):
+# ==========================================
+# PAPER TRADING EXECUTION ENGINE
+# ==========================================
+def process_market_arbitrage(market):
+    """Evaluates a market for arbitrage opportunities and executes paper trade."""
     global balance, locked_capital
-
-    up_token = info.get("Up")
-    down_token = info.get("Down")
-    title = info.get("title", "")[:55]
-
-    if (
-        not up_token
-        or not down_token
-        or cid in seen_markets
-        or len(open_positions) >= MAX_OPEN_MARKETS
-    ):
+    
+    title = market.get("question") or market.get("title") or "Unknown Market"
+    clob_tokens = market.get("clobTokenIds")
+    
+    # Parse token IDs for binary outcomes
+    if isinstance(clob_tokens, str):
+        try:
+            clob_tokens = json.loads(clob_tokens)
+        except Exception:
+            return
+            
+    if not clob_tokens or len(clob_tokens) < 2:
         return
 
+    up_token = clob_tokens[0]
+    down_token = clob_tokens[1]
+
+    # Get live prices from CLOB
     up_ask = get_best_ask(up_token)
     down_ask = get_best_ask(down_token)
 
+    # Fallback to Gamma prices if CLOB book is empty
     if up_ask is None or down_ask is None:
+        try:
+            outcome_prices = json.loads(market.get("outcomePrices", "[]"))
+            if len(outcome_prices) >= 2:
+                up_ask = up_ask or float(outcome_prices[0])
+                down_ask = down_ask or float(outcome_prices[1])
+        except Exception:
+            return
+
+    if up_ask is None or down_ask is None or up_ask <= 0 or down_ask <= 0:
         return
 
     combined_cost = up_ask + down_ask
     edge = 1.0 - combined_cost
 
-    if edge < MIN_EDGE:
-        return
+    # Print Live Scanning Diagnostics
+    short_title = (title[:32] + "..") if len(title) > 34 else title
+    print(f"  [SCAN] {short_title:<34} | UP: ${up_ask:.3f} | DOWN: ${down_ask:.3f} | Sum: ${combined_cost:.3f} | Edge: {edge*100:.2f}%", flush=True)
 
-    # Capital allocation safety check
-    spend = min(MAX_PER_MARKET, balance * 0.4)
-    if spend < 15 or (balance - spend) < 500:
-        return
+    # Check arbitrage execution condition
+    if edge >= MIN_EDGE:
+        if balance < MAX_TRADE_SIZE:
+            print(f"  [SKIP] Insufficient balance (${balance:.2f}) for trade size (${MAX_TRADE_SIZE:.2f})", flush=True)
+            return
 
-    # Equal Share Sizing: Buy identical share counts on both sides for risk-free arbitrage
-    shares = spend / combined_cost
-    up_cost = shares * up_ask
-    down_cost = shares * down_ask
-    total_spend = up_cost + down_cost
+        # Sizing calculation: Equal shares for complete hedge
+        shares = MAX_TRADE_SIZE / combined_cost
+        trade_cost = shares * combined_cost
+        guaranteed_payout = shares * 1.0
+        expected_profit = guaranteed_payout - trade_cost
 
-    position = {
-        "id": cid,
-        "title": title,
-        "open_time": datetime.now(timezone.utc),
-        "up_ask": up_ask,
-        "down_ask": down_ask,
-        "combined": combined_cost,
-        "edge": edge,
-        "spent": total_spend,
-        "shares": shares,
-        "status": "OPEN",
-    }
+        # Execute paper trade
+        balance -= trade_cost
+        
+        trade_record = {
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "market_title": title,
+            "up_ask": up_ask,
+            "down_ask": down_ask,
+            "combined_cost": combined_cost,
+            "shares": round(shares, 2),
+            "spend_usd": round(trade_cost, 2),
+            "expected_payout": round(guaranteed_payout, 2),
+            "expected_profit": round(expected_profit, 2),
+            "edge_pct": round(edge * 100, 2)
+        }
+        
+        trades_history.append(trade_record)
+        
+        print("\n" + "="*70, flush=True)
+        print(f"🚀 [PAPER TRADE EXECUTED] {title}", flush=True)
+        print(f"   Buy UP @ ${up_ask:.3f} + Buy DOWN @ ${down_ask:.3f} = Combined: ${combined_cost:.3f}", flush=True)
+        print(f"   Spent: ${trade_cost:.2f} | Shares: {shares:.2f} | Expected Payout: ${guaranteed_payout:.2f}", flush=True)
+        print(f"   Net Locked Profit: +${expected_profit:.2f} ({edge*100:.2f}% Edge)", flush=True)
+        print("="*70 + "\n", flush=True)
 
-    open_positions.append(position)
-    seen_markets.add(cid)
-
-    balance -= total_spend
-    locked_capital += total_spend
-
-    print("\n" + "=" * 70, flush=True)
-    print("PAPER TRADE OPENED - ARBITRAGE", flush=True)
-    print(f"Market   : {title}", flush=True)
-    print(f"Up Ask   : {up_ask:.4f} | Down Ask: {down_ask:.4f}", flush=True)
-    print(f"Combined : {combined_cost:.4f} | Guaranteed Edge: {edge*100:.2f}%", flush=True)
-    print(f"Shares   : {shares:.2f} pairs | Spent: ${total_spend:.2f}", flush=True)
-    print(f"Free Bal : ${balance:.2f} | Locked: ${locked_capital:.2f}", flush=True)
-    print("=" * 70 + "\n", flush=True)
-
-
-def check_resolutions():
-    global balance, locked_capital
-
-    now = datetime.now(timezone.utc)
-    still_open = []
-
-    for pos in open_positions:
-        age = (now - pos["open_time"]).total_seconds() / 60
-
-        if age >= 5.5:  # Simulate settlement after ~5.5 minutes
-            payout = pos["shares"] * 1.0  # Each paired share pays $1.00 guaranteed
-            profit = payout - pos["spent"]
-
-            balance += payout
-            locked_capital -= pos["spent"]
-
-            pos["status"] = "CLOSED"
-            pos["payout"] = payout
-            pos["profit"] = profit
-            pos["close_time"] = now
-
-            trade_history.append(pos)
-
-            print("\n" + "-" * 70, flush=True)
-            print("PAPER POSITION RESOLVED", flush=True)
-            print(f"Market : {pos['title']}", flush=True)
-            print(
-                f"Spent  : ${pos['spent']:.2f} → Guaranteed Payout: ${payout:.2f}",
-                flush=True,
-            )
-            print(f"Profit : ${profit:+.2f}", flush=True)
-            print(f"Balance: ${balance:.2f}", flush=True)
-            print("-" * 70 + "\n", flush=True)
-        else:
-            still_open.append(pos)
-
-    open_positions[:] = still_open
-
-
-def print_status():
-    total_equity = balance + locked_capital
-    print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] "
-        f"Balance: ${balance:.2f} | Locked: ${locked_capital:.2f} | "
-        f"Equity: ${total_equity:.2f} | Open: {len(open_positions)} | "
-        f"Trades: {len(trade_history)}",
-        flush=True,
-    )
-
-
-def save_summary_and_exit(signum=None, frame=None):
-    """Saves trade history and prints summary when Railway stops or restarts the worker."""
-    print("\n" + "=" * 70, flush=True)
-    print("SHUTTING DOWN / SAVING PAPER TRADES HISTORY", flush=True)
-    print("=" * 70, flush=True)
-    print(f"Starting Balance : ${STARTING_BALANCE:,.2f}", flush=True)
-    print(f"Final Balance    : ${balance:,.2f}", flush=True)
-    print(f"Total Profit     : ${balance - STARTING_BALANCE:+,.2f}", flush=True)
-    print(f"Total Trades     : {len(trade_history)}", flush=True)
-
-    if trade_history:
-        wins = sum(1 for t in trade_history if t["profit"] > 0)
-        print(
-            f"Win Rate         : {wins}/{len(trade_history)} ({wins/len(trade_history)*100:.1f}%)",
-            flush=True,
-        )
-
-        df = pd.DataFrame(trade_history)
-        filename = (
-            f"paper_trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        )
-        df.to_csv(filename, index=False)
-        print(f"Saved trade history → {filename}", flush=True)
-
-    print("=" * 70, flush=True)
-    sys.exit(0)
-
-
+# ==========================================
+# MAIN EXECUTION LOOP
+# ==========================================
 def main():
-    # Register shutdown handlers for Railway container lifecycle management
-    signal.signal(signal.SIGINT, save_summary_and_exit)
-    signal.signal(signal.SIGTERM, save_summary_and_exit)
+    print("="*70, flush=True)
+    print("      POLYMARKET 5m CRYPTO ARBITRAGE BOT (PAPER TRADING V2.0)")
+    print("="*70, flush=True)
+    print(f" Initial Balance : ${INITIAL_BALANCE:.2f}", flush=True)
+    print(f" Max Trade Size  : ${MAX_TRADE_SIZE:.2f}", flush=True)
+    print(f" Edge Threshold  : {MIN_EDGE*100:.1f}% (Minimum Gross Margin)", flush=True)
+    print(" Logging status  : Streaming live scan diagnostics to stdout\n", flush=True)
 
-    print("=" * 70, flush=True)
-    print("PAPER TRADING BOT STARTED - 24/7 MODE", flush=True)
-    print(f"Starting Balance : ${STARTING_BALANCE:,.2f}", flush=True)
-    print(f"Max per market   : ${MAX_PER_MARKET}", flush=True)
-    print(f"Min Edge         : {MIN_EDGE*100:.1f}%", flush=True)
-    print(f"Target Wallet    : {TARGET}", flush=True)
-    print("=" * 70 + "\n", flush=True)
-
-    # Infinite 24/7 Execution Loop
     while True:
-        try:
-            markets = discover_markets()
+        timestamp_str = datetime.now().strftime("%H:%M:%S")
+        
+        # 1. Gather markets to scan
+        markets_to_process = []
+        seen_ids = set()
 
-            for cid, info in markets.items():
-                try_open_position(cid, info)
+        # Target 5-Minute BTC Clock Slugs
+        for slug in get_btc_5m_slugs():
+            m = fetch_market_by_slug(slug)
+            if m and m.get("id") not in seen_ids:
+                markets_to_process.append(m)
+                seen_ids.add(m.get("id"))
 
-            check_resolutions()
-            print_status()
+        # Target Top Volume Gamma Markets
+        for m in fetch_top_gamma_markets():
+            if m.get("id") not in seen_ids:
+                markets_to_process.append(m)
+                seen_ids.add(m.get("id"))
 
-            time.sleep(POLL_SECONDS)
+        # 2. Evaluate markets for arbitrage
+        print(f"[{timestamp_str}] Scanning {len(markets_to_process)} active markets...", flush=True)
+        for market in markets_to_process:
+            process_market_arbitrage(market)
 
-        except Exception as e:
-            # Catch transient network/API issues to keep the 24/7 worker alive
-            print(
-                f"[{datetime.now().strftime('%H:%M:%S')}] Unexpected Loop Error: {e}",
-                flush=True,
-            )
-            time.sleep(POLL_SECONDS)
-
+        # 3. Print Portfolio Summary Status
+        equity = balance + locked_capital
+        print(f"[{timestamp_str}] Balance: ${balance:.2f} | Locked: ${locked_capital:.2f} | Equity: ${equity:.2f} | Open: {len(active_positions)} | Trades Captured: {len(trades_history)}\n", flush=True)
+        
+        time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     main()
